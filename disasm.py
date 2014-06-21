@@ -2,6 +2,7 @@
 
 import argparse
 import collections
+import itertools
 
 # cf http://mspgcc.sourceforge.net/manual/x223.html
 registers = ['pc', 'sp', 'sr', 'cg', 'r4', 'r5', 'r6', 'r7', 'r8', 'r9', 'r10', 'r11',
@@ -26,19 +27,20 @@ jmp_cond = 0x1c
 jmp_pc = 0x3
 jmp = ['jnz', 'jz', 'jnc', 'jc', 'jn', 'jge', 'jl', 'jmp']
 
-def todentry(line):
-  return (int(line[0], 16), [line[1][i:i+4] for i in range(0, len(line[1])-1, 4)])
+def todentry(line, idx):
+  return (int(line[0], 16), (idx, [line[1][i:i+4] for i in range(0, len(line[1])-1, 4)]))
 
 class InstructionStream:
   offset = 0
   def __init__(self, inp):
-    self.lines = collections.OrderedDict([todentry(line.split(':',1)) for line in inp])
+    self.lines = collections.OrderedDict([todentry(line.split(':',1), idx) for idx,
+      line in enumerate(inp)])
     self.lines_iter = self.lines.items().__iter__()
     self.next_line()
 
   def next_line(self):
     while True:
-      (loffset, code) = self.lines_iter.__next__()
+      (loffset, (idx, code)) = self.lines_iter.__next__()
       if code[0][0] == '*':
         continue
       break
@@ -59,16 +61,29 @@ class InstructionStream:
     self.offset += 2
     return word
 
+  def get_word_at(self, offset):
+    loffset = int(offset % 0x10)
+    goffset = offset - int(loffset)
+    loffset = int(loffset / 2)
+    (i, line) = self.lines[goffset]
+    self.lines_iter = itertools.islice(self.lines.items(), i+1, None)
+    self.words = line[loffset:].__iter__()
+    self.offset = offset
+
+    return self.words.__next__()
+
 class InvalidOpcodeError(Exception):
   def __init__(self, opcode):
     self.value = opcode
 
-def jump(instruction, offset):
+def jump(instruction, stream, offset):
   high = int(instruction[2:], 16)
   low = int(instruction[:2], 16)
   cond = (high & jmp_cond) >> 2
   pc = 2 * (1 + low + ((high & jmp_pc) << 8))
-  return "{:#x}:\t{}\t\t{} ${:+#x}".format(offset, instruction, jmp[cond], pc)
+  print("{:#x}:\t{}\t\t{} ${:+#x}".format(offset, instruction, jmp[cond], pc))
+  if cond == 0x7:
+    process(stream.get_word_at(offset + pc), offset + pc, stream)
 
 def swap(word):
   return word[2:] + word[:2]
@@ -118,8 +133,8 @@ def oneop(instruction, stream, offset):
     operand = stream.get_word()
 
   dst = addressing_fmt(addressing, reg, operand)
-  return "{:#x}:\t{} {}\t{}{} {}".format(offset, instruction, operand,
-    oneop_opc[opcode], byte_mode, dst)
+  print("{:#x}:\t{} {}\t{}{} {}".format(offset, instruction, operand,
+    oneop_opc[opcode], byte_mode, dst))
 
 def twoop(instruction, stream, offset):
   code = [instruction]
@@ -129,7 +144,8 @@ def twoop(instruction, stream, offset):
   if opcode-4 < 0:
     raise InvalidOpcodeError(opcode)
   elif instruction == '3041':
-    return "{:#x}:\t3041            ret".format(offset)
+    print("{:#x}:\t3041            ret".format(offset))
+    return
 
   src_reg = (high & reg_mask)
   dest_reg = (low & reg_mask)
@@ -148,18 +164,18 @@ def twoop(instruction, stream, offset):
   while len(code) != 3:
     code.append("    ")
 
-  return "{:#x}:\t{}\t{}{} {}, {}".format(offset, " ".join(code),
-    twoop_opc[opcode-4], byte_mode, src, dest)
+  print("{:#x}:\t{}\t{}{} {}, {}".format(offset, " ".join(code),
+    twoop_opc[opcode-4], byte_mode, src, dest))
 
 def process(word, offset, stream):
   high = int(word[2:], 16)
   if  high & jmp_flag == jmp_kind:
-    print(jump(word, offset))
+    jump(word, stream, offset)
   elif high & oneop_flag == oneop_kind:
-    print(oneop(word, stream, offset))
+    oneop(word, stream, offset)
   else:
     try:
-      print(twoop(word, stream, offset))
+      twoop(word, stream, offset)
     except InvalidOpcodeError as e:
       print("{:#x}:\t{}\t\tinvalid".format(offset, word))
 
