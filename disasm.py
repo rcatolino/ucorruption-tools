@@ -17,13 +17,43 @@ oneop_flag = 0xfc
 oneop_kind = 0x10
 oneop_oph = 0x3
 oneop_opl = 0x80
-oneop_opc = ['rrc', 'swp', 'rra', 'sxt', 'push', 'call', 'ret', 'invalid']
+oneop_opc = ['rrc', 'swp', 'rra', 'sxt', 'push', 'call', 'reti', 'invalid']
 
 jmp_kind = 0x20
 jmp_flag = 0xe0
 jmp_cond = 0x1c
 jmp_pc = 0x3
 jmp = ['jnz', 'jz', 'jnc', 'jc', 'jn', 'jge', 'jl', 'jmp']
+
+class InstructionStream:
+  offset = 0
+  def __init__(self, inp):
+    self.inp = inp
+    self.lines = iter(inp)
+    self.next_line()
+
+  def next_line(self):
+    while True:
+      [loffset, code] = self.lines.__next__().split(':', 1)
+      self.offset = int(loffset, 16) - 2
+      if code[0] == '*':
+        continue
+      break
+
+    self.words = [code[i:i+4] for i in range(0, len(code)-1, 4)].__iter__()
+
+  def get_word_and_offset(self):
+    return (self.get_word(), self.offset)
+
+  def get_word(self):
+    try:
+      word = self.words.__next__()
+    except StopIteration:
+      self.next_line()
+      word = self.words.__next__()
+
+    self.offset += 2
+    return word
 
 class InvalidOpcodeError(Exception):
   def __init__(self, opcode):
@@ -34,7 +64,7 @@ def jump(instruction, offset):
   low = int(instruction[:2], 16)
   cond = (high & jmp_cond) >> 2
   pc = 2 * (1 + low + ((high & jmp_pc) << 8))
-  return "{:#x}:\t{}\t\t{} pc{:+#x}".format(offset, instruction, jmp[cond], pc)
+  return "{:#x}:\t{}\t\t{} ${:+#x}".format(offset, instruction, jmp[cond], pc)
 
 def swap(word):
   return word[2:] + word[:2]
@@ -45,7 +75,33 @@ def get_byte_mode(byte):
   else:
     return ''
 
-def oneop(instruction, operand, offset):
+def addressing_fmt(kind, reg, word):
+  if reg == 2 and kind == 0x1:
+    return "&0x{}".format(swap(word))
+  elif reg == 2 and kind == 0x2:
+    return "#0x04"
+  elif reg == 2 and kind == 0x3:
+    return "#0x08"
+  elif reg == 3 and kind == 0x0:
+    return "#0x00"
+  elif reg == 3 and kind == 0x1:
+    return "#0x01"
+  elif reg == 3 and kind == 0x2:
+    return "#0x02"
+  elif reg == 3 and kind == 0x3:
+    return "#-0x01"
+  elif kind == 0x0:
+    return registers[reg]
+  elif kind == 0x1:
+    return "0x{}({})".format(swap(word), registers[reg])
+  elif kind == 0x2:
+    return "@{}".format(registers[reg])
+  elif reg == 0:
+    return "#0x{}".format(swap(word))
+  else:
+    return "@{}+".format(registers[reg])
+
+def oneop(instruction, stream, offset):
   high = int(instruction[2:], 16)
   low = int(instruction[:2], 16)
   opcode = (high & oneop_oph) << 1
@@ -53,83 +109,55 @@ def oneop(instruction, operand, offset):
   byte_mode = get_byte_mode(low)
   addressing = (low & laddressing_mask) >> 4
   reg = low & reg_mask
-  if addressing == 0x3:
-    return (1, "{:#x}:\t{} {}\t{}{} #0x{}".format(offset, instruction, operand,
-      oneop_opc[opcode], byte_mode, swap(operand)))
-  elif addressing == 0x2:
-    return (0, "{:#x}:\t{}\t\t{}{} @{}".format(offset, instruction, oneop_opc[opcode],
-      byte_mode, registers[reg]))
-  elif addressing == 0x1:
-    return (1, "{:#x}:\t{} {}\t{}{} 0x{}({})".format(offset, instruction, operand,
-      oneop_opc[opcode], byte_mode, swap(operand), registers[reg]))
-  elif addressing == 0x0:
-    return (0, "{:#x}:\t{}\t\t{}{} {}".format(offset, instruction, oneop_opc[opcode],
-      byte_mode, registers[reg]))
+  operand = "    "
+  if addressing == 0x1 or (addressing == 0x3 and reg == 0):
+    operand = stream.get_word()
 
-def twoop(instruction, operands, offset):
+  dst = addressing_fmt(addressing, reg, operand)
+  return "{:#x}:\t{} {}\t{}{} {}".format(offset, instruction, operand,
+    oneop_opc[opcode], byte_mode, dst)
+
+def twoop(instruction, stream, offset):
   code = [instruction]
   high = int(instruction[2:], 16)
   low = int(instruction[:2], 16)
   opcode = (high & 0xf0) >> 4
   if opcode-4 < 0:
     raise InvalidOpcodeError(opcode)
+  elif instruction == '3041':
+    return "{:#x}:\t3041            ret".format(offset)
 
   src_reg = (high & reg_mask)
   dest_reg = (low & reg_mask)
   byte_mode = get_byte_mode(low)
   saddressing = (low & laddressing_mask) >> 4
   daddressing = (low & haddressing_mask) >> 7
-  if saddressing == 0x0:
-    code.append('\t')
-    src = registers[src_reg]
-  elif saddressing == 0x1:
-    code.append(operands.pop())
-    src = "0x{}({})".format(swap(code[1]), registers[src_reg])
-  elif saddressing == 0x2:
-    code.append('\t')
-    src = "@{}".format(registers[src_reg])
+  code = [instruction]
+  if saddressing == 0x1 or (saddressing == 0x3 and src_reg == 0):
+    code.append(stream.get_word())
+
+  src = addressing_fmt(saddressing, src_reg, code[-1])
+  if daddressing == 0x1:
+    code.append(stream.get_word())
+
+  dest = addressing_fmt(daddressing, dest_reg, code[-1])
+  while len(code) != 3:
+    code.append("    ")
+
+  return "{:#x}:\t{}\t{}{} {}, {}".format(offset, " ".join(code),
+    twoop_opc[opcode-4], byte_mode, src, dest)
+
+def process(word, offset, stream):
+  high = int(word[2:], 16)
+  if  high & jmp_flag == jmp_kind:
+    print(jump(word, offset))
+  elif high & oneop_flag == oneop_kind:
+    print(oneop(word, stream, offset))
   else:
-    code.append(operands.pop())
-    src = "#0x{}".format(swap(code[-1]))
-
-  if daddressing == 0x0:
-    code.append('\t')
-    dest = registers[dest_reg]
-  else:
-    code.append(operands.pop())
-    dest = "0x{}({})".format(swap(code[-1]), registers[dest_reg])
-  return (2-len(operands), "{:#x}:\t{}\t{}{} {} {}".format(offset, " ".join(code),
-    twoop_opc[opcode-4], byte_mode, src, dest))
-
-def dis_line(leftovers, code, offset):
-  opcodes = [code[i:i+4] for i in range(0, len(code)-1, 4)]
-  i = 0
-  listing = []
-  while i != len(opcodes):
-    next = opcodes[i]
-    high = int(next[2:], 16)
-    if  high & jmp_flag == jmp_kind:
-      listing.append(jump(next, offset + i*4))
-    elif i == len(opcodes) - 1:
-      leftovers = [next]
-    elif high & oneop_flag == oneop_kind:
-      (c, res) = oneop(next, opcodes[i+1], offset + i*4)
-      listing.append(res)
-      i += c
-    elif i == len(opcodes) - 2:
-      leftovers = [next, opcodes[i+1]]
-      i += 1
-    else:
-      try:
-        (c, res) = twoop(next, [opcodes[i+1], opcodes[i+2]], offset + i*4)
-        listing.append(res)
-        i += c
-      except InvalidOpcodeError as e:
-        listing.append("{:#x}:\t{}\t\t invalid".format(offset + i*4, next))
-
-    i += 1
-
-  return (leftovers, listing)
+    try:
+      print(twoop(word, stream, offset))
+    except InvalidOpcodeError as e:
+      print("{:#x}:\t{}\t\tinvalid".format(offset, word))
 
 def get_args():
   parser = argparse.ArgumentParser('Disassemble an msp430 binary')
@@ -145,24 +173,12 @@ def main():
     print("Offset must be aligned on a 2 byte boundary")
     return
 
-  leftovers = []
-  disassembly = []
-  for line in inp:
-    [loffset, code] = line.split(':', 1)
-    loffset = int(loffset, 16)
-    if code[0] == '*':
-      if len(leftovers) != 0:
-        # Use 0 as arguments.
-        print(leftovers)
-      continue
-
-    if offset - loffset > 0x10:
-      continue
-    elif loffset <= offset:
-      (leftovers, disassembly) = dis_line(leftovers, code[offset - loffset:], offset)
-    else:
-      (leftovers, disassembly) = dis_line(leftovers, code, loffset)
-
-    print('\n'.join(disassembly))
+  istream = InstructionStream(inp)
+  while True:
+    try:
+      (next, offset) = istream.get_word_and_offset()
+      process(next, offset, istream)
+    except StopIteration:
+      break
 
 main()
