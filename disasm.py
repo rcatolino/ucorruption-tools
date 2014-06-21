@@ -1,6 +1,7 @@
 #!/usr/bin/python3
 
 import argparse
+import collections
 
 # cf http://mspgcc.sourceforge.net/manual/x223.html
 registers = ['pc', 'sp', 'sr', 'cg', 'r4', 'r5', 'r6', 'r7', 'r8', 'r9', 'r10', 'r11',
@@ -25,22 +26,25 @@ jmp_cond = 0x1c
 jmp_pc = 0x3
 jmp = ['jnz', 'jz', 'jnc', 'jc', 'jn', 'jge', 'jl', 'jmp']
 
+def todentry(line):
+  return (int(line[0], 16), [line[1][i:i+4] for i in range(0, len(line[1])-1, 4)])
+
 class InstructionStream:
   offset = 0
   def __init__(self, inp):
-    self.inp = inp
-    self.lines = iter(inp)
+    self.lines = collections.OrderedDict([todentry(line.split(':',1)) for line in inp])
+    self.lines_iter = self.lines.items().__iter__()
     self.next_line()
 
   def next_line(self):
     while True:
-      [loffset, code] = self.lines.__next__().split(':', 1)
-      self.offset = int(loffset, 16) - 2
-      if code[0] == '*':
+      (loffset, code) = self.lines_iter.__next__()
+      if code[0][0] == '*':
         continue
       break
 
-    self.words = [code[i:i+4] for i in range(0, len(code)-1, 4)].__iter__()
+    self.offset = loffset - 2
+    self.words = code.__iter__()
 
   def get_word_and_offset(self):
     return (self.get_word(), self.offset)
