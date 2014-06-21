@@ -3,6 +3,7 @@
 import argparse
 import collections
 import itertools
+import os
 
 # cf http://mspgcc.sourceforge.net/manual/x223.html
 registers = ['pc', 'sp', 'sr', 'cg', 'r4', 'r5', 'r6', 'r7', 'r8', 'r9', 'r10', 'r11',
@@ -29,6 +30,9 @@ jmp = ['jnz', 'jz', 'jnc', 'jc', 'jn', 'jge', 'jl', 'jmp']
 
 def todentry(line, idx):
   return (int(line[0], 16), (idx, [line[1][i:i+4] for i in range(0, len(line[1])-1, 4)]))
+
+def toword(string):
+  return int(string[:2], 16) + (int(string[2:], 16) << 8)
 
 class InstructionStream:
   offset = 0
@@ -81,9 +85,15 @@ def jump(instruction, stream, offset):
   low = int(instruction[:2], 16)
   cond = (high & jmp_cond) >> 2
   pc = 2 * (1 + low + ((high & jmp_pc) << 8))
-  print("{:#x}:\t{}\t\t{} ${:+#x}".format(offset, instruction, jmp[cond], pc))
+  if pc >= 1 << 10:
+    pc = -1 * ((1 << 10) - pc & (1 << 10) - 1)
+
   if cond == 0x7:
+    print('--------')
     process(stream.get_word_at(offset + pc), offset + pc, stream)
+  else:
+    print("{:#x}:\t{}\t\t{} ${:+#x}\t\t--> {:#x}".format(offset, instruction, jmp[cond], pc,
+      pc + offset))
 
 def swap(word):
   return word[2:] + word[:2]
@@ -164,8 +174,16 @@ def twoop(instruction, stream, offset):
   while len(code) != 3:
     code.append("    ")
 
-  print("{:#x}:\t{}\t{}{} {}, {}".format(offset, " ".join(code),
-    twoop_opc[opcode-4], byte_mode, src, dest))
+  if opcode == 4 and src_reg == 1 and saddressing == 0x3:
+    print("{:#x}:\t{}            pop {}".format(offset, instruction, dest))
+    return
+  if opcode == 4 and dest_reg == 0 and daddressing == 0 and src_reg == 0 and saddressing == 0x3:
+    address = toword(code[1])
+    print('--------')
+    process(stream.get_word_at(address), address, stream)
+  else:
+    print("{:#x}:\t{}\t{}{} {}, {}".format(offset, " ".join(code),
+      twoop_opc[opcode-4], byte_mode, src, dest))
 
 def process(word, offset, stream):
   high = int(word[2:], 16)
@@ -181,19 +199,28 @@ def process(word, offset, stream):
 
 def get_args():
   parser = argparse.ArgumentParser('Disassemble an msp430 binary')
-  parser.add_argument('input', type=argparse.FileType('r'), help='binary to disassemble')
-  parser.add_argument('-o', '--offset', default = 0x00, type=int,
+  parser.add_argument('input', help='binary to disassemble')
+  parser.add_argument('-o', '--offset', default = '0',
                       help='offset at which to start disassembly')
   args = parser.parse_args()
   return (args.input, args.offset)
 
 def main():
   (inp, offset) = get_args()
+  os.system('./reformat.sh ' + inp)
+  inp = inp + '.list'
+  infile = open(inp)
+  offset = int(offset, 16)
   if offset % 0x2 != 0:
     print("Offset must be aligned on a 2 byte boundary")
     return
 
-  istream = InstructionStream(inp)
+  istream = InstructionStream(infile)
+  os.system('rm ' + inp)
+  if offset != 0x0:
+    next = istream.get_word_at(offset)
+    process(next, offset, istream)
+
   while True:
     try:
       (next, offset) = istream.get_word_and_offset()
